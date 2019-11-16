@@ -99,15 +99,25 @@ static const u8* trampoline_fmt_32 =
 # afl-fuzz
 编译target完成后，就可以通过afl-fuzz开始fuzzing了。其大致思路是，对输入的seed文件不断地变化，并将这些mutated input喂给target执行，检查是否会造成崩溃。因此，fuzzing涉及到大量的fork和执行target的过程。
 AFL实现了一套fork server机制。其基本思路是：启动target进程后，target会运行一个fork server；fuzzer并不负责fork子进程，而是与这个fork server通信，并由fork server来完成fork及继续执行目标的操作。这样设计的最大好处，就是不需要调用execve()，从而节省了载入目标文件和库、解析符号地址等重复性工作。
+```
+afl-fuzz --fork--> (forkserver --execve--> target) --fork--> target's child
+    |                  |
+    <-------pipe------->
+```
 ## fork server
 * `init_forkserver`函数初始化`forkerserver`。此时父进程仍为`fuzzer`，子进程为`forkerserver`。
 * 父进程和子进程之间采用管道通信。具体使用了2个管道，一个用于传递状态，另一个用于传递命令。
+* 子进程创建完成后就调用`execev`执行目标被fuzz进程。
 ```c
   if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
   forksrv_pid = fork();
-  ...
-  if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
-  if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");  
+  if (!forksrv_pid) {
+    ...
+    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
+    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");  
+    ...
+    execv(target_path, argv);
+  }
   ...
   fsrv_ctl_fd = ctl_pipe[1];
   fsrv_st_fd  = st_pipe[0];
@@ -121,7 +131,8 @@ AFL实现了一套fork server机制。其基本思路是：启动target进程后
     return;
   }  
 ```
-* 子进程`forkserver`与父进程通信。通过`__afl_forkserver`向管道写入数据，通知父进程。然后进入等待，通过`__afl_fork_wait_loop`读取管道数据。如果满足要求就调用`fork`
+* 子进程`forkserver`与父进程通信代码在插桩代码`__afl_maybe_log`中。
+* `__afl_forkserver`向管道写入数据，通知父进程。然后进入等待，通过`__afl_fork_wait_loop`读取管道数据。接收都命令就`fork`子进程(被测程序)
 ```c
   "__afl_forkserver:\n"
   "\n"
@@ -169,6 +180,29 @@ AFL实现了一套fork server机制。其基本思路是：启动target进程后
   "  jl   __afl_die\n"
   "  je   __afl_fork_resume\n"
   "\n"
+  ```
+  * forkserver fork出来的子进程跳转到`__afl_fork_resume`，会关闭管道，并跳转到`__afl_store`，继续开始执行被测程序。
+  ```c
+    "__afl_fork_resume:\n"
+  "\n"
+  "  /* In child process: close fds, resume execution. */\n"
+  "\n"
+  "  pushl $" STRINGIFY(FORKSRV_FD) "\n"
+  "  call  close\n"
+  "\n"
+  "  pushl $" STRINGIFY((FORKSRV_FD + 1)) "\n"
+  "  call  close\n"
+  "\n"
+  "  addl  $8, %esp\n"
+  "\n"
+  "  popl %edx\n"
+  "  popl %ecx\n"
+  "  popl %eax\n"
+  "  jmp  __afl_store\n"
+  "\n"
+  ```
+  * forkserver将fork出来的子进程的pid写入管道，通知父进程`fuzzer`。然后等待子进程执行完毕，将子进程结束状态写入管道通知父进程。接着继续进入`__afl_fork_wait_loop`等待父进程下发命令。
+  ```c
   "  /* In parent process: write PID to pipe, then wait for child. */\n"
   "\n"
   "  movl  %eax, __afl_fork_pid\n"
@@ -198,22 +232,34 @@ AFL实现了一套fork server机制。其基本思路是：启动target进程后
   "\n"
   "  jmp __afl_fork_wait_loop\n"
   "\n"
-  "__afl_fork_resume:\n"
-  "\n"
-  "  /* In child process: close fds, resume execution. */\n"
-  "\n"
-  "  pushl $" STRINGIFY(FORKSRV_FD) "\n"
-  "  call  close\n"
-  "\n"
-  "  pushl $" STRINGIFY((FORKSRV_FD + 1)) "\n"
-  "  call  close\n"
-  "\n"
-  "  addl  $8, %esp\n"
-  "\n"
-  "  popl %edx\n"
-  "  popl %ecx\n"
-  "  popl %eax\n"
-  "  jmp  __afl_store\n"
-  "\n"
   ```
+  * 父进程通过`run_target`来向管道下发命令，通知forkserver执行fork
+  ```c
+      s32 res;
+    /* In non-dumb mode, we have the fork server up and running, so simply
+       tell it to have at it, and then read back PID. */
+    if ((res = write(fsrv_ctl_fd, &prev_timed_out, 4)) != 4) {
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+    }    
+    if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+    }
+    if (child_pid <= 0) FATAL("Fork server is misbehaving (OOM?)");
+  }
+  ```
+  * 父进程记录被测程序的推出状态
+  ```c
+      if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to communicate with fork server (OOM?)");
+    }
+    ...
+    if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to communicate with fork server (OOM?)");
+    }
+```  
+  
   
