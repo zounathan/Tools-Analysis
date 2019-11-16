@@ -261,5 +261,233 @@ afl-fuzz --fork--> (forkserver --execve--> target) --fork--> target's child
       RPFATAL(res, "Unable to communicate with fork server (OOM?)");
     }
 ```  
-  
-  
+# qemu mode
+## 插桩
+* qemu模式下，插桩的代码也是`afl_maybe_log`。不同于编译插桩，qemu模式下不是用随机值来标识代码块。而是通过当前代码块地址计算得到`cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8); cur_loc &= MAP_SIZE - 1;`，然后将对应共享内存中的字节累加。
+```c
+static inline void afl_maybe_log(abi_ulong cur_loc) {
+
+  static __thread abi_ulong prev_loc;
+
+  /* Optimize for cur_loc > afl_end_code, which is the most likely case on
+     Linux systems. */
+
+  if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
+    return;
+
+  /* Looks like QEMU always maps to fixed locations, so ASAN is not a
+     concern. Phew. But instruction addresses may be aligned. Let's mangle
+     the value to get something quasi-uniform. */
+
+  cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8);
+  cur_loc &= MAP_SIZE - 1;
+
+  /* Implement probabilistic instrumentation by looking at scrambled block
+     address. This keeps the instrumented locations stable across runs. */
+
+  if (cur_loc >= afl_inst_rms) return;
+
+  afl_area_ptr[cur_loc ^ prev_loc]++;
+  prev_loc = cur_loc >> 1;
+
+}
+```
+## forkserver  
+* 与编译模式类似，`forkserver`启动后会向管道写数据通知`fuzzer`，然后进入死循环等待命令下发。
+```c
+  if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+  ...
+  while (1) {
+    ...
+    if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
+    ...
+  }
+``` 
+* 接收到命令后，就会fork子进程开始fuzz
+```c
+    child_pid = fork();
+    if (child_pid < 0) exit(4);
+
+    if (!child_pid) {
+
+      /* Child process. Close descriptors and run free. */
+
+      afl_fork_child = 1;
+      close(FORKSRV_FD);
+      close(FORKSRV_FD + 1);
+      close(t_fd[0]);
+      return;
+
+    }
+```
+* forkserver等待子进程执行完，并向fuzzer返回子进程结束状态
+```c
+    if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
+
+    /* Collect translation requests until child dies and closes the pipe. */
+
+    afl_wait_tsl(cpu, t_fd[0]);
+
+    /* Get and relay exit status to parent. */
+
+    if (waitpid(child_pid, &status, 0) < 0) exit(6);
+    if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
+```
+# 变异
+* AFL维护了一个队列(queue)，每次从这个队列中取出一个文件，对其进行大量变异，并检查运行后是否会引起目标崩溃、发现新路径等结果。变异的主要类型如下：
+1. bitflip，按位翻转，1变为0，0变为1
+2. arithmetic，整数加/减算术运算
+3. interest，把一些特殊内容替换到原文件中
+4. dictionary，把自动生成或用户提供的token替换/插入到原文件中
+5. havoc，中文意思是“大破坏”，此阶段会对原文件进行大量变异，具体见下文
+6. splice，中文意思是“绞接”，此阶段会将两个文件拼接起来得到一个新的文件
+
+## bitflip
+* bitflip会根据翻转量/步长进行多种不同的翻转，按照顺序依次为：
+1. bitflip 1/1，每次翻转1个bit，按照每1个bit的步长从头开始
+2. bitflip 2/1，每次翻转相邻的2个bit，按照每1个bit的步长从头开始
+3. bitflip 4/1，每次翻转相邻的4个bit，按照每1个bit的步长从头开始
+4. bitflip 8/8，每次翻转相邻的8个bit，按照每8个bit的步长从头开始，即依次对每个byte做翻转
+5. bitflip 16/8，每次翻转相邻的16个bit，按照每8个bit的步长从头开始，即依次对每个word做翻转
+6. bitflip 32/8，每次翻转相邻的32个bit，按照每8个bit的步长从头开始，即依次对每个dword做翻转
+### 自动touken检测
+* 在进行bitflip 1/1变异时，对于每个byte的最低位(least significant bit)翻转还进行了额外的处理：如果连续多个bytes的最低位被翻转后，程序的执行路径都未变化，而且与原始执行路径不一致(检测程序执行路径的方式可见上篇文章中“分支信息的分析”一节)，那么就把这一段连续的bytes判断是一条token。
+* 为了控制这样自动生成的token的大小和数量，AFL还在`config.h`中通过宏定义了限制
+```c
+/* Length limits for auto-detected dictionary tokens: */
+
+#define MIN_AUTO_EXTRA      3
+#define MAX_AUTO_EXTRA      32
+/* Maximum number of auto-extracted dictionary tokens to actually use in fuzzing
+   (first value), and to keep in memory as candidates. The latter should be much
+   higher than the former. */
+
+#define USE_AUTO_EXTRAS     50
+#define MAX_AUTO_EXTRAS     (USE_AUTO_EXTRAS * 10)
+```
+### effector map
+* 在进行bitflip 8/8变异时，AFL还生成了一个非常重要的信息：effector map。
+* 在对每个byte进行翻转时，如果其造成执行路径与原始路径不一致，就将该byte在effector map中标记为1，即“有效”的，否则标记为0，即“无效”的。后续fuzz会重点针对有效字节。
+## arithmetic
+* 与bitflip类似的是，arithmetic根据目标大小的不同，也分为了多个子阶段：
+1. arith 8/8，每次对8个bit进行加减运算，按照每8个bit的步长从头开始，即对文件的每个byte进行整数加减变异
+2. arith 16/8，每次对16个bit进行加减运算，按照每8个bit的步长从头开始，即对文件的每个word进行整数加减变异
+3. arith 32/8，每次对32个bit进行加减运算，按照每8个bit的步长从头开始，即对文件的每个dword进行整数加减变异
+* 运算的上限在`config.h`中定义。
+```c
+/* Maximum offset for integer addition / subtraction stages: */
+
+#define ARITH_MAX           35
+```
+* 对于运算后结果和`bitflip`一样的用例会直接跳过不执行。
+## interest
+* interest分为以下几个阶段
+1. interest 8/8，每次对8个bit进替换，按照每8个bit的步长从头开始，即对文件的每个byte进行替换
+2. interest 16/8，每次对16个bit进替换，按照每8个bit的步长从头开始，即对文件的每个word进行替换
+3. interest 32/8，每次对32个bit进替换，按照每8个bit的步长从头开始，即对文件的每个dword进行替换
+* interest值在`config.h`中定义
+```c
+#define INTERESTING_8 \
+  -128,          /* Overflow signed 8-bit when decremented  */ \
+  -1,            /*                                         */ \
+   0,            /*                                         */ \
+   1,            /*                                         */ \
+   16,           /* One-off with common buffer size         */ \
+   32,           /* One-off with common buffer size         */ \
+   64,           /* One-off with common buffer size         */ \
+   100,          /* One-off with common buffer size         */ \
+   127           /* Overflow signed 8-bit when incremented  */
+
+#define INTERESTING_16 \
+  -32768,        /* Overflow signed 16-bit when decremented */ \
+  -129,          /* Overflow signed 8-bit                   */ \
+   128,          /* Overflow signed 8-bit                   */ \
+   255,          /* Overflow unsig 8-bit when incremented   */ \
+   256,          /* Overflow unsig 8-bit                    */ \
+   512,          /* One-off with common buffer size         */ \
+   1000,         /* One-off with common buffer size         */ \
+   1024,         /* One-off with common buffer size         */ \
+   4096,         /* One-off with common buffer size         */ \
+   32767         /* Overflow signed 16-bit when incremented */
+
+#define INTERESTING_32 \
+  -2147483648LL, /* Overflow signed 32-bit when decremented */ \
+  -100663046,    /* Large negative number (endian-agnostic) */ \
+  -32769,        /* Overflow signed 16-bit                  */ \
+   32768,        /* Overflow signed 16-bit                  */ \
+   65535,        /* Overflow unsig 16-bit when incremented  */ \
+   65536,        /* Overflow unsig 16 bit                   */ \
+   100663045,    /* Large positive number (endian-agnostic) */ \
+   2147483647    /* Overflow signed 32-bit when incremented */
+```
+## dictionary
+* dictionary有如下几个阶段
+1. user extras (over)，从头开始，将用户提供的tokens依次替换到原文件中
+2. user extras (insert)，从头开始，将用户提供的tokens依次插入到原文件中
+3. auto extras (over)，从头开始，将自动检测的tokens依次替换到原文件中
+* 用户提供的tokens，是在词典文件中设置并通过`-x`选项指定的，如果没有则跳过相应的子阶段。
+### user extras (over)
+* AFL先按照长度从小到大进行排序，然后检查tokens的数量，如果数量大于预设的`MAX_DET_EXTRAS`（默认值为200），那么对每个token会根据概率来决定是否进行替换：
+```c
+#define MAX_DET_EXTRAS      200
+```
+```c
+    for (j = 0; j < extras_cnt; j++) {
+
+      /* Skip extras probabilistically if extras_cnt > MAX_DET_EXTRAS. Also
+         skip them if there's no room to insert the payload, if the token
+         is redundant, or if its entire span has no bytes set in the effector
+         map. */
+
+      if ((extras_cnt > MAX_DET_EXTRAS && UR(extras_cnt) >= MAX_DET_EXTRAS) ||
+          extras[j].len > len - i ||
+          !memcmp(extras[j].data, out_buf + i, extras[j].len) ||
+          !memchr(eff_map + EFF_APOS(i), 1, EFF_SPAN_ALEN(i, extras[j].len))) {
+
+        stage_max--;
+        continue;
+
+      }
+
+      last_len = extras[j].len;
+      memcpy(out_buf + i, extras[j].data, last_len);
+
+      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+
+      stage_cur++;
+
+    }
+``` 
+* 这里的`UR(extras_cnt)`是运行时生成的一个0到`extras_cnt`之间的随机数。
+### user extras (insert)
+* 这个阶段没有对tokens数量的限制，全部tokens都会从原文件的第1个byte开始，依次向后插入；
+* 由于原文件并未发生替换，所以`effector map`不会被使用。
+* 这一子阶段最特别的地方，就是变异不能简单地恢复。AFL采取的方式是：将原文件分割为插入前和插入后的部分，再加上插入的内容，将这3部分依次复制到目标缓冲区中。
+### auto extras (over)
+* 这一阶段与`user extras (over)`很类似，区别在于，这里的`tokens`是最开始`bitflip`阶段自动生成的。
+* 自动生成的`tokens`总量会由`USE_AUTO_EXTRAS`限制。
+## havoc
+* havoc包含了对原文件的多轮变异，每一轮都是将多种方式组合（stacked）而成
+1. 随机选取某个bit进行翻转
+2. 随机选取某个byte，将其设置为随机的interesting value
+3. 随机选取某个word，并随机选取大、小端序，将其设置为随机的interesting value
+4. 随机选取某个dword，并随机选取大、小端序，将其设置为随机的interesting value
+5. 随机选取某个byte，对其减去一个随机数
+6. 随机选取某个byte，对其加上一个随机数
+7. 随机选取某个word，并随机选取大、小端序，对其减去一个随机数
+8. 随机选取某个word，并随机选取大、小端序，对其加上一个随机数
+9. 随机选取某个dword，并随机选取大、小端序，对其减去一个随机数
+10. 随机选取某个dword，并随机选取大、小端序，对其加上一个随机数
+11. 随机选取某个byte，将其设置为随机数
+12. 随机删除一段bytes
+13. 随机选取一个位置，插入一段随机长度的内容，其中75%的概率是插入原文中随机位置的内容，25%的概率是插入一段随机选取的数
+14. 随机选取一个位置，替换为一段随机长度的内容，其中75%的概率是替换成原文中随机位置的内容，25%的概率是替换成一段随机选取的数
+15. 随机选取一个位置，用随机选取的token（用户提供的或自动生成的）替换
+16. 随机选取一个位置，用随机选取的token（用户提供的或自动生成的）插入
+## splice
+* splice是将两个seed文件拼接得到新的文件，并对这个新文件继续执行havoc变异。
+* AFL在seed文件队列中随机选取一个，与当前的seed文件做对比。如果两者差别不大，就再重新随机选一个；如果两者相差比较明显，那么就随机选取一个位置，将两者都分割为头部和尾部。最后，将当前文件的头部与随机文件的尾部拼接起来，就得到了新的文件。
+## cycle
+* 当队列中的全部文件都变异测试后，就完成了一个`cycle`，整个队列又会从第一个文件开始，再次进行变异，不过与第一次变异不同的是，这一次就不需要再进行`deterministic fuzzing`(前4项)了。
+
+
