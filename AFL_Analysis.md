@@ -181,7 +181,7 @@ afl-fuzz --fork--> (forkserver --execve--> target) --fork--> target's child
   "  je   __afl_fork_resume\n"
   "\n"
   ```
-  * forkserver fork出来的子进程跳转到`__afl_fork_resume`，会关闭管道，并跳转到`__afl_store`，继续开始执行被测程序。
+  * forkserver fork出来的子进程跳转到`__afl_fork_resume`，会关闭管道，并跳转到`__afl_store`，继续进入`main`开始执行被测程序。
   ```c
     "__afl_fork_resume:\n"
   "\n"
